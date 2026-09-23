@@ -14,6 +14,12 @@ from .core import (
     format_symbol,
 )
 from .errors import FDToolError, InvalidInputError, SearchBudgetExhausted
+from .selection import (
+    MAX_CANDIDATES,
+    SELECT_MAX_ATTRIBUTES,
+    SelectionResult,
+    select_decomposition,
+)
 
 __all__ = [
     "analyze",
@@ -27,4 +33,8 @@ __all__ = [
     "SearchBudgetExhausted",
     "MAX_ATTRIBUTES",
     "DEFAULT_STEP_BUDGET",
+    "select_decomposition",
+    "SelectionResult",
+    "MAX_CANDIDATES",
+    "SELECT_MAX_ATTRIBUTES",
 ]
