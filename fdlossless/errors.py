@@ -15,6 +15,19 @@ class InvalidInputError(FDToolError, ValueError):
     """
 
 
+class NoFeasibleDecomposition(FDToolError):
+    """No selection of the candidate subrelations meets every constraint.
+
+    Raised by ``select_decomposition`` when no subset of the candidates
+    simultaneously covers all attributes, keeps every required attribute
+    group inside one selected subrelation, is lossless, and preserves the
+    dependencies.  The message states which constraint class failed (and,
+    for the lossless/preservation conflict, how many otherwise-eligible
+    selections failed on each count).  This is a proven no-solution
+    verdict within the given candidate set, not a budget exhaustion.
+    """
+
+
 class SearchBudgetExhausted(FDToolError):
     """The chase used up its merge budget before reaching a verdict.
 

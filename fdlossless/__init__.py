@@ -13,18 +13,34 @@ from .core import (
     analyze,
     format_symbol,
 )
-from .errors import FDToolError, InvalidInputError, SearchBudgetExhausted
+from .errors import (
+    FDToolError,
+    InvalidInputError,
+    NoFeasibleDecomposition,
+    SearchBudgetExhausted,
+)
+from .select import (
+    MAX_CANDIDATES,
+    MAX_SELECT_ATTRIBUTES,
+    SelectionResult,
+    select_decomposition,
+)
 
 __all__ = [
     "analyze",
+    "select_decomposition",
     "format_symbol",
     "AnalysisResult",
+    "SelectionResult",
     "ChaseStep",
     "CounterExample",
     "FD",
     "FDToolError",
     "InvalidInputError",
+    "NoFeasibleDecomposition",
     "SearchBudgetExhausted",
     "MAX_ATTRIBUTES",
+    "MAX_SELECT_ATTRIBUTES",
+    "MAX_CANDIDATES",
     "DEFAULT_STEP_BUDGET",
 ]
