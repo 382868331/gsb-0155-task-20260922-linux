@@ -22,6 +22,7 @@ from itertools import combinations
 from .errors import InvalidInputError, SearchBudgetExhausted
 
 MAX_ATTRIBUTES = 12
+MAX_ATTRIBUTES_MVD = 8
 DEFAULT_STEP_BUDGET = 100_000
 
 
@@ -95,11 +96,94 @@ class AnalysisResult:
     counterexample: CounterExample | None
 
 
+@dataclass(frozen=True)
+class MVD:
+    """A multivalued dependency X ->> Y with normalized sides.
+
+    Attributes of Y already present in X have been removed, so
+    ``lhs`` and ``rhs`` are disjoint and ``rhs`` is non-empty.
+    Both tuples follow the canonical (input) attribute order.
+    """
+
+    lhs: tuple[str, ...]
+    rhs: tuple[str, ...]
+
+    def __str__(self) -> str:  # pragma: no cover - cosmetic
+        left = ",".join(self.lhs) if self.lhs else "∅"
+        right = ",".join(self.rhs)
+        return f"{left} ->> {right}"
+
+
+@dataclass(frozen=True)
+class ChaseEvent:
+    """One chase step under functional AND multivalued dependencies.
+
+    ``kind`` is ``"fd-merge"`` (two symbols are equated) or
+    ``"mvd-row"`` (a new tableau row is generated).
+    For ``"mvd-row"``, ``rows`` are the (0-based) parent rows and
+    ``added_row`` carries the formatted symbols of the new row.
+    """
+
+    step: int
+    kind: str
+    dependency: str
+    rows: tuple[int, ...]
+    added_row: tuple[str, ...] | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class MVDImplication:
+    """Result of testing whether FDs + MVDs imply a candidate MVD.
+
+    When the MVD is not implied, ``counterexample`` is a finite relation
+    (tuple of integer-constant tuples, in attribute order) that satisfies
+    every input FD and MVD but violates the queried MVD; it has been
+    checked by brute force before being returned.
+    """
+
+    mvd: MVD
+    implied: bool
+    chase_log: tuple[ChaseEvent, ...]
+    counterexample: tuple[tuple[int, ...], ...] | None
+    detail: str
+
+
+@dataclass(frozen=True)
+class FourNFViolation:
+    """A non-trivial MVD that violates 4NF on one subrelation.
+
+    ``determinant_superkey`` is always ``False`` for a genuine violation
+    (4NF requires every non-trivial MVD X ->> Y to have X a superkey);
+    the flag is kept explicitly so the superkey check is part of the
+    output rather than an implicit reason.
+    """
+
+    subrelation: tuple[str, ...]
+    mvd: MVD
+    determinant_superkey: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class FourNFResult:
+    attributes: tuple[str, ...]
+    fds: tuple[FD, ...]
+    mvds: tuple[MVD, ...]
+    decomposition: tuple[tuple[str, ...], ...]
+    candidate_keys: tuple[tuple[str, ...], ...]
+    lossless: bool
+    chase_log: tuple[ChaseEvent, ...]
+    counterexample: CounterExample | None
+    violations: tuple[FourNFViolation, ...]
+    is_4nf: bool
+
+
 # ---------------------------------------------------------------------------
 # Input validation (reject, never silently correct)
 # ---------------------------------------------------------------------------
 
-def _validate_attributes(attributes) -> tuple[str, ...]:
+def _validate_attributes(attributes, limit: int = MAX_ATTRIBUTES) -> tuple[str, ...]:
     if isinstance(attributes, (str, bytes)):
         raise InvalidInputError(
             "attributes: expected an iterable of names, not a single string"
@@ -128,10 +212,10 @@ def _validate_attributes(attributes) -> tuple[str, ...]:
         if a in seen:
             raise InvalidInputError(f"attributes[{i}]: duplicate attribute {a!r}")
         seen.add(a)
-    if len(items) > MAX_ATTRIBUTES:
+    if len(items) > limit:
         raise InvalidInputError(
             f"attributes: {len(items)} attributes given, at most "
-            f"{MAX_ATTRIBUTES} allowed"
+            f"{limit} allowed"
         )
     return tuple(items)
 
@@ -266,6 +350,53 @@ def _validate_budget(step_budget) -> int:
             f"step_budget: budget must be >= 0, got {step_budget}"
         )
     return step_budget
+
+
+def _validate_mvds(MVDs, attrs: tuple[str, ...]) -> tuple[tuple[frozenset, frozenset], ...]:
+    """Validate MVDs and normalize: attributes of Y already in X are removed.
+
+    Returns (lhs, rhs) frozenset pairs with disjoint sides and non-empty rhs.
+    """
+    if isinstance(MVDs, (str, bytes)):
+        raise InvalidInputError("MVDs: expected an iterable of (lhs, rhs) pairs")
+    try:
+        items = list(MVDs)
+    except TypeError:
+        raise InvalidInputError(
+            f"MVDs: expected an iterable of (lhs, rhs) pairs, "
+            f"got {type(MVDs).__name__}"
+        ) from None
+    known = frozenset(attrs)
+    normalized: list[tuple[frozenset, frozenset]] = []
+    seen = set()
+    for i, mvd in enumerate(items):
+        if isinstance(mvd, (str, bytes, set, frozenset)):
+            raise InvalidInputError(
+                f"MVDs[{i}]: expected an ordered (lhs, rhs) pair, got {mvd!r}"
+            )
+        try:
+            lhs_raw, rhs_raw = mvd
+        except (TypeError, ValueError):
+            raise InvalidInputError(
+                f"MVDs[{i}]: expected a (lhs, rhs) pair, got {mvd!r}"
+            ) from None
+        lhs = _validate_name_set(lhs_raw, f"MVDs[{i}].lhs", known)
+        rhs = _validate_name_set(rhs_raw, f"MVDs[{i}].rhs", known)
+        rhs = rhs - lhs
+        if not rhs:
+            raise InvalidInputError(
+                f"MVDs[{i}].rhs: right-hand side is empty after removing "
+                "attributes already in the determinant"
+            )
+        key = (lhs, rhs)
+        if key in seen:
+            raise InvalidInputError(
+                f"MVDs[{i}]: duplicate MVD {sorted(lhs)} ->> {sorted(rhs)} "
+                "after normalization"
+            )
+        seen.add(key)
+        normalized.append(key)
+    return tuple(normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +657,194 @@ def _build_counterexample(attrs, fds, decomp, table) -> CounterExample:
 
 
 # ---------------------------------------------------------------------------
+# Chase under functional AND multivalued dependencies
+# ---------------------------------------------------------------------------
+
+def _canon_mvd(attrs, pair) -> MVD:
+    lhs, rhs = pair
+    return MVD(
+        lhs=tuple(a for a in attrs if a in lhs),
+        rhs=tuple(a for a in attrs if a in rhs),
+    )
+
+
+def _chase_general(attrs, fds, mvds, decomp, budget: int):
+    """Chase with FD equality merges and MVD row generation.
+
+    The budget counts every step: each symbol merge and each added row.
+    Returns (lossless, final_table, log).
+    """
+    n = len(attrs)
+    index = {a: j for j, a in enumerate(attrs)}
+    table = [
+        [("d", j) if attrs[j] in part else ("n", i, j) for j in range(n)]
+        for i, part in enumerate(decomp)
+    ]
+    rowset = {tuple(row) for row in table}
+    log: list[ChaseEvent] = []
+    steps = 0
+
+    def spend():
+        nonlocal steps
+        if steps >= budget:
+            raise SearchBudgetExhausted(
+                f"chase budget exhausted after {steps} step(s) "
+                f"(merges + generated rows, step_budget={budget}); no "
+                "verdict reached — this is not a proof that the "
+                "decomposition is lossy"
+            )
+        steps += 1
+
+    changed = True
+    while changed:
+        changed = False
+        for lhs, rhs in fds:
+            (a_name,) = rhs
+            a = index[a_name]
+            cols = [index[x] for x in lhs]
+            for i in range(len(table)):
+                for j in range(i + 1, len(table)):
+                    if all(table[i][c] == table[j][c] for c in cols):
+                        si, sj = table[i][a], table[j][a]
+                        if si == sj:
+                            continue
+                        kept = min(si, sj)
+                        replaced = max(si, sj)
+                        spend()
+                        for row in table:
+                            for c in range(n):
+                                if row[c] == replaced:
+                                    row[c] = kept
+                        rowset.clear()
+                        rowset.update(tuple(r) for r in table)
+                        fd_obj = FD(
+                            lhs=tuple(x for x in attrs if x in lhs), rhs=a_name
+                        )
+                        lhs_txt = ",".join(fd_obj.lhs) if fd_obj.lhs else "∅"
+                        log.append(
+                            ChaseEvent(
+                                step=steps,
+                                kind="fd-merge",
+                                dependency=str(fd_obj),
+                                rows=(i, j),
+                                added_row=None,
+                                detail=(
+                                    f"rows {i + 1} and {j + 1} agree on "
+                                    f"{{{lhs_txt}}}; FD {lhs_txt} -> {a_name} "
+                                    f"equates column {a_name}: "
+                                    f"{format_symbol(replaced, attrs)} := "
+                                    f"{format_symbol(kept, attrs)}"
+                                ),
+                            )
+                        )
+                        changed = True
+        for lhs, rhs in mvds:
+            xcols = [index[x] for x in lhs]
+            xset = set(xcols)
+            ycols = {index[y] for y in rhs}
+            mvd_txt = str(_canon_mvd(attrs, (lhs, rhs)))
+            m = len(table)
+            for i in range(m):
+                for j in range(m):
+                    if i == j:
+                        continue
+                    if not all(table[i][c] == table[j][c] for c in xcols):
+                        continue
+                    new = tuple(
+                        table[i][c] if (c in xset or c in ycols) else table[j][c]
+                        for c in range(n)
+                    )
+                    if new in rowset:
+                        continue
+                    spend()
+                    table.append(list(new))
+                    rowset.add(new)
+                    formatted = tuple(format_symbol(s, attrs) for s in new)
+                    log.append(
+                        ChaseEvent(
+                            step=steps,
+                            kind="mvd-row",
+                            dependency=mvd_txt,
+                            rows=(i, j),
+                            added_row=formatted,
+                            detail=(
+                                f"rows {i + 1} and {j + 1} agree on the "
+                                f"determinant of {mvd_txt}; generated row "
+                                f"{len(table)} = {formatted} (row {i + 1} "
+                                f"on X∪Y, row {j + 1} on the rest)"
+                            ),
+                        )
+                    )
+                    changed = True
+    lossless = any(all(s[0] == "d" for s in row) for row in table)
+    return lossless, table, tuple(log)
+
+
+# ---------------------------------------------------------------------------
+# Finite instances: satisfaction checks and witnesses
+# ---------------------------------------------------------------------------
+
+def _instance_from_table(attrs, table) -> tuple[tuple[int, ...], ...]:
+    """Map a final tableau to a finite relation of integer constants."""
+    n = len(attrs)
+    mapping: dict = {}
+    next_const = n  # distinguished symbol for column j maps to j (< n)
+
+    def const(sym) -> int:
+        nonlocal next_const
+        if sym[0] == "d":
+            return sym[1]
+        if sym not in mapping:
+            mapping[sym] = next_const
+            next_const += 1
+        return mapping[sym]
+
+    instance: list[tuple[int, ...]] = []
+    seen = set()
+    for row in table:
+        t = tuple(const(s) for s in row)
+        if t not in seen:
+            seen.add(t)
+            instance.append(t)
+    return tuple(instance)
+
+
+def _mvd_holds(instance, xcols, ycols, n: int) -> bool:
+    """Brute-force check of X ->> Y on a finite relation."""
+    xy = set(xcols) | set(ycols)
+    tset = set(instance)
+    for t1 in instance:
+        for t2 in instance:
+            if all(t1[c] == t2[c] for c in xcols):
+                t3 = tuple(t1[c] if c in xy else t2[c] for c in range(n))
+                if t3 not in tset:
+                    return False
+    return True
+
+
+def _satisfies_all(instance, fds, mvds, index, n: int) -> bool:
+    if not _satisfies(instance, fds, index):
+        return False
+    for lhs, rhs in mvds:
+        xcols = [index[x] for x in lhs]
+        ycols = [index[y] for y in rhs]
+        if not _mvd_holds(instance, xcols, ycols, n):
+            return False
+    return True
+
+
+def _mvd_implication_chase(attrs, fds, mvds, x, y, budget: int):
+    """Test D ⊨ X ->> Y via a two-row tableau chase.
+
+    Row 1 is distinguished on X∪Y, row 2 on X∪Z (Z = R − X − Y).
+    The MVD is implied iff the chase derives an all-distinguished row.
+    """
+    z = frozenset(a for a in attrs if a not in x and a not in y)
+    decomp = (frozenset(x) | frozenset(y), frozenset(x) | z)
+    return _chase_general(attrs, fds, mvds, decomp, budget)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -590,4 +909,230 @@ def analyze(attributes, FDs, decomposition, *, step_budget=DEFAULT_STEP_BUDGET):
         lossless=lossless,
         chase_log=log,
         counterexample=counterexample,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public helpers: closure and implication
+# ---------------------------------------------------------------------------
+
+def attribute_closure(attributes, FDs, seed) -> tuple[str, ...]:
+    """Closure of ``seed`` under ``FDs``, in canonical attribute order."""
+    attrs = _validate_attributes(attributes)
+    fds = _validate_fds(FDs, attrs)
+    seed_set = _validate_name_set(seed, "seed", frozenset(attrs))
+    closed = _closure(fds, seed_set)
+    return tuple(a for a in attrs if a in closed)
+
+
+def check_fd(attributes, FDs, lhs, rhs) -> bool:
+    """True iff ``FDs`` logically imply ``lhs -> rhs`` (rhs non-empty)."""
+    attrs = _validate_attributes(attributes)
+    fds = _validate_fds(FDs, attrs)
+    known = frozenset(attrs)
+    left = _validate_name_set(lhs, "lhs", known)
+    right = _validate_name_set(rhs, "rhs", known)
+    if not right:
+        raise InvalidInputError("rhs: right-hand side must be non-empty")
+    return right <= _closure(fds, left)
+
+
+def check_mvd(attributes, FDs, MVDs, lhs, rhs, *,
+              step_budget=DEFAULT_STEP_BUDGET) -> MVDImplication:
+    """Test whether FDs + MVDs imply ``lhs ->> rhs``.
+
+    Attributes of ``rhs`` already in ``lhs`` are removed first.  When the
+    MVD is not implied, the result carries a finite counterexample relation
+    that satisfies every input dependency but violates the queried MVD;
+    the witness is verified by brute force before being returned.
+    """
+    attrs = _validate_attributes(attributes, limit=MAX_ATTRIBUTES_MVD)
+    fds = _validate_fds(FDs, attrs)
+    mvds = _validate_mvds(MVDs, attrs)
+    budget = _validate_budget(step_budget)
+    known = frozenset(attrs)
+    left = _validate_name_set(lhs, "lhs", known)
+    right = _validate_name_set(rhs, "rhs", known)
+    right = right - left
+    if not right:
+        raise InvalidInputError(
+            "rhs: right-hand side is empty after removing attributes "
+            "already in the determinant"
+        )
+    query = _canon_mvd(attrs, (left, right))
+    implied, table, log = _mvd_implication_chase(
+        attrs, fds, mvds, left, right, budget
+    )
+    counterexample = None
+    if implied:
+        detail = f"{query} is implied by the given FDs and MVDs (chase derived an all-distinguished row)."
+    else:
+        n = len(attrs)
+        index = {a: j for j, a in enumerate(attrs)}
+        instance = _instance_from_table(attrs, table)
+        if not _satisfies_all(instance, fds, mvds, index, n):
+            raise AssertionError(
+                "internal error: counterexample violates an input dependency"
+            )
+        xcols = [index[x] for x in left]
+        ycols = [index[y] for y in right]
+        if _mvd_holds(instance, xcols, ycols, n):
+            raise AssertionError(
+                "internal error: counterexample satisfies the queried MVD"
+            )
+        counterexample = instance
+        detail = (
+            f"{query} is NOT implied; counterexample relation "
+            f"{list(instance)} satisfies every input FD and MVD but "
+            "violates the queried MVD."
+        )
+    return MVDImplication(
+        mvd=query,
+        implied=implied,
+        chase_log=log,
+        counterexample=counterexample,
+        detail=detail,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4NF decomposition analysis under FDs + MVDs
+# ---------------------------------------------------------------------------
+
+def analyze4nf(attributes, FDs, MVDs, decomposition, *,
+               step_budget=DEFAULT_STEP_BUDGET) -> FourNFResult:
+    """Verify a decomposition against 4NF under functional + multivalued deps.
+
+    Reports the lossless-join verdict (chase with FD merges and MVD row
+    generation, with a verified counterexample when lossy) and every
+    4NF violation: a non-trivial MVD X ->> Y implied by the input
+    dependencies with X, Y inside one subrelation, X ∪ Y ≠ subrelation,
+    and X not a superkey of that subrelation (superkeys are decided by
+    FD closure only — MVDs never make a determinant a key).
+
+    Only minimal left-hand sides and inclusion-minimal right-hand sides
+    are reported.  No cheapest decomposition is searched for; the given
+    decomposition is verified as-is.
+    """
+    attrs = _validate_attributes(attributes, limit=MAX_ATTRIBUTES_MVD)
+    fds = _validate_fds(FDs, attrs)
+    mvds = _validate_mvds(MVDs, attrs)
+    decomp = _validate_decomposition(decomposition, attrs)
+    budget = _validate_budget(step_budget)
+
+    keys = _candidate_keys(attrs, fds)
+    lossless, table, log = _chase_general(attrs, fds, mvds, decomp, budget)
+
+    counterexample = None
+    if not lossless:
+        n = len(attrs)
+        index = {a: j for j, a in enumerate(attrs)}
+        instance = _instance_from_table(attrs, table)
+        if not _satisfies_all(instance, fds, mvds, index, n):
+            raise AssertionError(
+                "internal error: counterexample violates an input dependency"
+            )
+        spurious = tuple(range(n))
+        projections = []
+        for part in decomp:
+            cols = [index[a] for a in attrs if a in part]
+            projections.append(
+                tuple(sorted({tuple(t[c] for c in cols) for t in instance}))
+            )
+        for part, proj in zip(decomp, projections):
+            cols = [index[a] for a in attrs if a in part]
+            if tuple(spurious[c] for c in cols) not in proj:
+                raise AssertionError(
+                    "internal error: spurious tuple not in join"
+                )
+        if spurious in instance:
+            raise AssertionError(
+                "internal error: spurious tuple already in instance"
+            )
+        counterexample = CounterExample(
+            instance=instance,
+            projections=tuple(projections),
+            spurious_tuple=spurious,
+            explanation=(
+                f"instance r = {list(instance)} satisfies every input FD and "
+                f"MVD, and t = {spurious} lies in the natural join of the "
+                "projections (its restriction to each subrelation occurs in "
+                "that projection), but t is not a tuple of r; the join "
+                "produces a tuple the original relation does not have."
+            ),
+        )
+
+    # 4NF check: implied non-trivial MVDs inside each subrelation.
+    memo: dict = {}
+
+    def implied(x, y) -> bool:
+        key = (x, y)
+        if key not in memo:
+            memo[key] = _mvd_implication_chase(
+                attrs, fds, mvds, x, y, budget
+            )[0]
+        return memo[key]
+
+    violations: list[FourNFViolation] = []
+    for part in decomp:
+        s_attrs = tuple(a for a in attrs if a in part)
+        s_set = frozenset(part)
+        for xsize in range(len(s_attrs) + 1):
+            for xcombo in combinations(s_attrs, xsize):
+                x = frozenset(xcombo)
+                superkey = _closure(fds, x) >= s_set
+                if superkey:
+                    continue  # X a superkey: no 4NF violation via X
+                rest = [a for a in s_attrs if a not in x]
+                found: list[frozenset] = []  # minimal violating rhs sets
+                for ysize in range(1, len(rest) + 1):
+                    for ycombo in combinations(rest, ysize):
+                        y = frozenset(ycombo)
+                        if y == frozenset(rest):
+                            continue  # trivial: X ∪ Y = subrelation
+                        if any(f <= y for f in found):
+                            continue  # non-minimal rhs
+                        if not implied(x, y):
+                            continue
+                        found.append(y)
+                        mvd = _canon_mvd(attrs, (x, y))
+                        sub_txt = ",".join(s_attrs)
+                        violations.append(
+                            FourNFViolation(
+                                subrelation=s_attrs,
+                                mvd=mvd,
+                                determinant_superkey=False,
+                                detail=(
+                                    f"subrelation {{{sub_txt}}}: {mvd} is "
+                                    "non-trivial (Y ⊄ X and X ∪ Y ≠ "
+                                    "subrelation) and implied by the input "
+                                    f"dependencies, but {{{','.join(mvd.lhs)}}}"
+                                    " is not a superkey of the subrelation "
+                                    "(its FD closure does not cover it) — "
+                                    "4NF violated."
+                                ),
+                            )
+                        )
+
+    def sort_mvds(pairs):
+        return tuple(sorted((_canon_mvd(attrs, p) for p in pairs),
+                            key=lambda m: (m.lhs, m.rhs)))
+
+    return FourNFResult(
+        attributes=attrs,
+        fds=tuple(sorted(
+            (FD(lhs=tuple(a for a in attrs if a in l), rhs=next(iter(r)))
+             for l, r in fds),
+            key=lambda f: (f.lhs, f.rhs),
+        )),
+        mvds=sort_mvds(mvds),
+        decomposition=tuple(
+            tuple(a for a in attrs if a in part) for part in decomp
+        ),
+        candidate_keys=keys,
+        lossless=lossless,
+        chase_log=log,
+        counterexample=counterexample,
+        violations=tuple(violations),
+        is_4nf=not violations,
     )
